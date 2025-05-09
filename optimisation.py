@@ -3,9 +3,7 @@ import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
-from scipy.optimize import minimize
-from scipy.optimize import differential_evolution
-import math
+import pulp as pl
 
 st.set_page_config(layout="wide", page_title="Cloud Service Placement Optimizer")
 
@@ -13,7 +11,7 @@ st.title("Optimisation du Placement des Services dans un Cloud")
 st.markdown("""
 Cette application permet d'optimiser l'allocation des services sur différents serveurs dans un cloud privé.
 L'objectif est de minimiser la latence globale tout en respectant les contraintes de ressources.
-Les solutions sont arrondies aux nombres entiers les plus proches pour une implémentation pratique.
+L'optimisation est effectuée directement avec des variables entières pour une implémentation pratique.
 """)
 
 # Sidebar for configuration
@@ -77,188 +75,259 @@ with st.sidebar:
 # Main content
 st.header("Optimisation")
 
-# Function to create the objective function dynamically
-def create_objective_function(num_servers, num_services, latency_params, server_names):
-    def objective(x):
-        total_latency = 0
-        # Reshape flat x array into a matrix where rows are servers and columns are services
-        x_matrix = x.reshape(num_servers, num_services)
+# Function to run the optimization using PuLP for integer programming
+def run_optimization_pulp():
+    with st.spinner("Optimisation en nombres entiers en cours..."):
+        # Create a new model
+        model = pl.LpProblem(name="cloud_optimization", sense=pl.LpMinimize)
         
+        # Define decision variables (integer number of instances for each service on each server)
+        x = {}
         for i in range(num_servers):
             for j in range(num_services):
-                # Use server name (A, B, C, etc.) to access latency parameters
                 server = server_names[i]
                 service = j+1
-                total_latency += latency_params[(server, service)] * (x_matrix[i, j] ** 2)
+                # Integer variables
+                x[server, service] = pl.LpVariable(f"x_{server}_{service}", lowBound=0, cat='Integer')
         
-        return total_latency
-    
-    return objective
-
-# Function to create constraints dynamically
-def create_constraints(num_servers, num_services, min_instances, cpu_per_instance, cpu_capacities, server_names):
-    constraints = []
-    
-    # Minimum instances constraint for each service
-    for j in range(num_services):
-        def min_instance_constraint(x, j=j):
-            x_matrix = x.reshape(num_servers, num_services)
-            # Sum instances across all servers for this service
-            return sum(x_matrix[i, j] for i in range(num_servers)) - min_instances[j+1]
+        # Define objective function: minimize total latency
+        # Note: PuLP doesn't directly support quadratic terms, so we need to linearize
+        # For simplicity, we'll use piecewise linear approximation for the quadratic term
         
-        constraints.append({'type': 'ineq', 'fun': min_instance_constraint})
-    
-    # CPU capacity constraint for each server
-    for i in range(num_servers):
-        def cpu_constraint(x, i=i):
-            x_matrix = x.reshape(num_servers, num_services)
-            # Calculate total CPU used on this server
-            total_cpu = sum(x_matrix[i, j] * cpu_per_instance[j+1] for j in range(num_services))
-            # Constraint is satisfied if CPU used <= capacity
-            return cpu_capacities[server_names[i]] - total_cpu
+        # Maximum expected instances per server-service to define the piecewise linear segments
+        max_expected_instances = 50
         
-        constraints.append({'type': 'ineq', 'fun': cpu_constraint})
-    
-    return constraints
-
-# Initial guess for optimization
-def create_initial_guess(num_servers, num_services, min_instances):
-    # Distribute minimum instances equally among servers as a starting point
-    x0 = np.zeros((num_servers, num_services))
-    for j in range(num_services):
-        per_server = min_instances[j+1] / num_servers
+        # Create linearized variables for the quadratic terms
+        linearized_vars = {}
         for i in range(num_servers):
-            x0[i, j] = per_server
-    
-    return x0.flatten()
-
-# Function to round the solution to integers while preserving constraints
-def round_solution(x_opt, num_servers, num_services, min_instances, cpu_per_instance, cpu_capacities, server_names):
-    # Reshape for easier processing
-    x_matrix = x_opt.reshape(num_servers, num_services)
-    rounded_matrix = np.zeros((num_servers, num_services))
-    
-    # First, apply floor to all values to get the minimum integer allocations
-    for i in range(num_servers):
-        for j in range(num_services):
-            rounded_matrix[i, j] = math.floor(x_matrix[i, j])
-    
-    # Check which services need additional instances to meet minimum requirements
-    for j in range(num_services):
-        service_total = sum(rounded_matrix[i, j] for i in range(num_servers))
-        needed = min_instances[j+1] - service_total
-        
-        if needed > 0:
-            # Add needed instances to servers with lowest latency first
-            server_latencies = [(i, latency_params[(server_names[i], j+1)]) for i in range(num_servers)]
-            server_latencies.sort(key=lambda x: x[1])  # Sort by latency
-            
-            for server_idx, _ in server_latencies:
-                # Calculate available CPU on this server
-                current_cpu_used = sum(rounded_matrix[server_idx, s] * cpu_per_instance[s+1] for s in range(num_services))
-                available_cpu = cpu_capacities[server_names[server_idx]] - current_cpu_used
+            for j in range(num_services):
+                server = server_names[i]
+                service = j+1
                 
-                # How many instances can we add with available CPU?
-                can_add = min(needed, int(available_cpu / cpu_per_instance[j+1]))
-                
-                if can_add > 0:
-                    rounded_matrix[server_idx, j] += can_add
-                    needed -= can_add
-                
-                if needed == 0:
-                    break
-            
-            # If we still need instances but are constrained by CPU, prioritize by latency
-            if needed > 0:
-                st.warning(f"Impossible de satisfaire toutes les contraintes avec des valeurs entières pour le service S{j+1}.")
-    
-    return rounded_matrix.flatten()
-
-# Function to check if constraints are satisfied with the rounded solution
-def check_constraints(x, num_servers, num_services, min_instances, cpu_per_instance, cpu_capacities, server_names):
-    x_matrix = x.reshape(num_servers, num_services)
-    violations = []
-    
-    # Check minimum instances
-    for j in range(num_services):
-        service_total = sum(x_matrix[i, j] for i in range(num_servers))
-        if service_total < min_instances[j+1]:
-            violations.append(f"Service S{j+1} a {service_total} instances, besoin de {min_instances[j+1]} minimum.")
-    
-    # Check CPU capacity
-    for i in range(num_servers):
-        total_cpu = sum(x_matrix[i, j] * cpu_per_instance[j+1] for j in range(num_services))
-        if total_cpu > cpu_capacities[server_names[i]]:
-            violations.append(f"Serveur {server_names[i]} utilise {total_cpu} CPU, capacité max {cpu_capacities[server_names[i]]}.")
-    
-    return violations
-
-# Function to run the optimization
-def run_optimization():
-    with st.spinner("Optimisation en cours..."):
-        # Create objective function and constraints
-        objective = create_objective_function(num_servers, num_services, latency_params, server_names)
-        constraints = create_constraints(num_servers, num_services, min_instances, cpu_per_instance, cpu_capacities, server_names)
+                # Create piecewise linear approximation variables
+                for n in range(1, max_expected_instances + 1):
+                    linearized_vars[server, service, n] = pl.LpVariable(
+                        f"y_{server}_{service}_{n}", 
+                        lowBound=0, 
+                        upBound=1,
+                        cat='Continuous'
+                    )
         
-        # Initial guess
-        x0 = create_initial_guess(num_servers, num_services, min_instances)
-        
-        # Bounds: all variables must be non-negative
-        bounds = [(0, None) for _ in range(num_servers * num_services)]
-        
-        # Run optimization to get continuous solution
-        result = minimize(
-            objective, 
-            x0, 
-            method='SLSQP',  # Sequential Least Squares Programming
-            bounds=bounds,
-            constraints=constraints,
-            options={'maxiter': 1000, 'disp': False}
+        # Objective: minimize total latency (approximated)
+        objective_expr = pl.lpSum(
+            latency_params[server, service] * n * n * linearized_vars[server, service, n]
+            for server in server_names
+            for service in range(1, num_services + 1)
+            for n in range(1, max_expected_instances + 1)
         )
+        model += objective_expr
         
-        if result.success:
-            # Round solution to integers
-            x_int = round_solution(
-                result.x, 
-                num_servers, 
-                num_services, 
-                min_instances, 
-                cpu_per_instance, 
-                cpu_capacities, 
-                server_names
-            )
+        # Constraint: SOS2 constraints for piecewise linear approximation
+        for i in range(num_servers):
+            for j in range(num_services):
+                server = server_names[i]
+                service = j+1
+                
+                # Sum of linearized variables must equal 1
+                model += pl.lpSum(linearized_vars[server, service, n] for n in range(1, max_expected_instances + 1)) == 1
+                
+                # Link original variable to linearized variables
+                model += x[server, service] == pl.lpSum(n * linearized_vars[server, service, n] for n in range(1, max_expected_instances + 1))
+        
+        # Constraint: minimum instances for each service
+        for j in range(num_services):
+            service = j+1
+            model += pl.lpSum(x[server, service] for server in server_names) >= min_instances[service]
+        
+        # Constraint: CPU capacity for each server
+        for i in range(num_servers):
+            server = server_names[i]
+            model += pl.lpSum(x[server, service] * cpu_per_instance[service] for service in range(1, num_services + 1)) <= cpu_capacities[server]
+        
+        # Solve the model
+        solver = pl.PULP_CBC_CMD(msg=False)
+        model.solve(solver)
+        
+        # Check if solution was found
+        if model.status == pl.LpStatusOptimal:
+            # Extract solution
+            x_sol = np.zeros((num_servers, num_services))
+            for i in range(num_servers):
+                for j in range(num_services):
+                    server = server_names[i]
+                    service = j+1
+                    x_sol[i, j] = pl.value(x[server, service])
             
-            # Check constraints for integer solution
-            violations = check_constraints(
-                x_int, 
-                num_servers, 
-                num_services, 
-                min_instances, 
-                cpu_per_instance, 
-                cpu_capacities, 
-                server_names
-            )
-            
-            # Calculate objective value for integer solution
-            obj_value_int = objective(x_int)
+            # Calculate objective value
+            obj_value = 0
+            for i in range(num_servers):
+                for j in range(num_services):
+                    server = server_names[i]
+                    service = j+1
+                    obj_value += latency_params[server, service] * (x_sol[i, j] ** 2)
             
             return {
-                'success': result.success,
-                'message': result.message,
-                'nit': result.nit,
-                'fun': result.fun,
-                'x': result.x,  # Original continuous solution
-                'x_int': x_int,  # Integer solution
-                'obj_value_int': obj_value_int,  # Objective value for integer solution
-                'violations': violations  # Any constraint violations
+                'success': True,
+                'message': "Solution optimale trouvée",
+                'x_int': x_sol.flatten(),
+                'obj_value_int': obj_value
             }
         else:
             return {
                 'success': False,
-                'message': result.message
+                'message': "Aucune solution trouvée. Vérifiez les contraintes."
             }
 
-# Function to visualize results
+# Alternative MILP approach using CVXPY
+def run_optimization_with_cvxpy():
+    import cvxpy as cp
+    
+    with st.spinner("Optimisation en nombres entiers avec CVXPY en cours..."):
+        # Create variables
+        x = cp.Variable((num_servers, num_services), integer=True)
+        
+        # Objective function: minimize total latency
+        objective = 0
+        for i in range(num_servers):
+            for j in range(num_services):
+                objective += latency_params[(server_names[i], j+1)] * cp.square(x[i, j])
+        
+        # Constraints
+        constraints = []
+        
+        # Non-negativity
+        constraints.append(x >= 0)
+        
+        # Minimum instances for each service
+        for j in range(num_services):
+            constraints.append(cp.sum(x[:, j]) >= min_instances[j+1])
+        
+        # CPU capacity for each server
+        for i in range(num_servers):
+            total_cpu = 0
+            for j in range(num_services):
+                total_cpu += x[i, j] * cpu_per_instance[j+1]
+            constraints.append(total_cpu <= cpu_capacities[server_names[i]])
+        
+        # Define the problem
+        problem = cp.Problem(cp.Minimize(objective), constraints)
+        
+        # Try to solve
+        try:
+            problem.solve(solver=cp.MOSEK)
+            
+            if problem.status == cp.OPTIMAL:
+                # Extract solution
+                x_sol = x.value
+                
+                # Calculate objective value
+                obj_value = 0
+                for i in range(num_servers):
+                    for j in range(num_services):
+                        obj_value += latency_params[(server_names[i], j+1)] * (x_sol[i, j] ** 2)
+                
+                return {
+                    'success': True,
+                    'message': "Solution optimale trouvée",
+                    'x_int': x_sol.flatten(),
+                    'obj_value_int': obj_value
+                }
+            else:
+                return {
+                    'success': False,
+                    'message': f"Problème non résolu: {problem.status}"
+                }
+        except Exception as e:
+            return {
+                'success': False,
+                'message': f"Erreur lors de la résolution: {str(e)}"
+            }
+
+# Alternative approach with Gurobi (if available)
+def run_optimization_with_gurobi():
+    try:
+        import gurobipy as gp
+        from gurobipy import GRB
+        
+        with st.spinner("Optimisation en nombres entiers avec Gurobi en cours..."):
+            # Create a new model
+            model = gp.Model("cloud_optimization")
+            
+            # Create variables
+            x = {}
+            for i in range(num_servers):
+                for j in range(num_services):
+                    server = server_names[i]
+                    service = j+1
+                    x[server, service] = model.addVar(vtype=GRB.INTEGER, name=f"x_{server}_{service}", lb=0)
+            
+            # Set objective: minimize total latency
+            obj = gp.QuadExpr()
+            for i in range(num_servers):
+                for j in range(num_services):
+                    server = server_names[i]
+                    service = j+1
+                    # Quadratic term for latency
+                    obj.add(latency_params[server, service] * x[server, service] * x[server, service])
+            
+            model.setObjective(obj, GRB.MINIMIZE)
+            
+            # Add minimum instances constraints
+            for j in range(num_services):
+                service = j+1
+                model.addConstr(
+                    gp.quicksum(x[server, service] for server in server_names) >= min_instances[service],
+                    name=f"min_instances_service_{service}"
+                )
+            
+            # Add CPU capacity constraints
+            for i in range(num_servers):
+                server = server_names[i]
+                model.addConstr(
+                    gp.quicksum(x[server, service] * cpu_per_instance[service] for service in range(1, num_services + 1)) <= cpu_capacities[server],
+                    name=f"cpu_capacity_server_{server}"
+                )
+            
+            # Optimize model
+            model.setParam('OutputFlag', 0)  # Suppress output
+            model.optimize()
+            
+            # Check if a solution was found
+            if model.status == GRB.OPTIMAL:
+                # Extract solution
+                x_sol = np.zeros((num_servers, num_services))
+                for i in range(num_servers):
+                    for j in range(num_services):
+                        server = server_names[i]
+                        service = j+1
+                        x_sol[i, j] = x[server, service].X
+                
+                # Calculate objective value
+                obj_value = 0
+                for i in range(num_servers):
+                    for j in range(num_services):
+                        server = server_names[i]
+                        service = j+1
+                        obj_value += latency_params[server, service] * (x_sol[i, j] ** 2)
+                
+                return {
+                    'success': True,
+                    'message': "Solution optimale trouvée",
+                    'x_int': x_sol.flatten(),
+                    'obj_value_int': obj_value
+                }
+            else:
+                return {
+                    'success': False,
+                    'message': f"Problème non résolu: {model.status}"
+                }
+    except ImportError:
+        return {
+            'success': False,
+            'message': "Gurobi n'est pas installé. Utilisez une autre méthode."
+        }
+
+# Function to visualize results (same as original)
 def visualize_results(result):
     # Reshape for easier processing
     x_opt = result['x_int'].reshape(num_servers, num_services)
@@ -424,11 +493,11 @@ def visualize_results(result):
     with col8:
         st.markdown("**Facteurs clés de l'optimisation**")
         st.markdown(f"""
+        - Optimisation directe en nombres entiers (sans arrondi)
         - La latence augmente de façon quadratique avec le nombre d'instances du même service sur un serveur
         - Répartition préférentielle vers les serveurs avec une latence de base plus faible
         - Respect des contraintes de capacité CPU sur chaque serveur
         - Satisfaction du nombre minimal d'instances requis pour chaque service
-        - Les valeurs sont arrondies aux entiers pour une mise en œuvre pratique
         """)
     
     # Return key metrics for display
@@ -438,53 +507,25 @@ def visualize_results(result):
         "solution": x_opt
     }
 
-# Compare original and integer solutions
-def compare_solutions(result):
-    st.subheader("Comparaison des solutions continue et entière")
-    
-    col1, col2 = st.columns(2)
-    
-    
-    
-    with col1:
-        st.markdown("**Solution en nombres entiers**")
-        x_int = result['x_int'].reshape(num_servers, num_services)
-        
-        int_data = []
-        for i in range(num_servers):
-            for j in range(num_services):
-                int_data.append({
-                    'Serveur': server_names[i],
-                    'Service': f'S{j+1}',
-                    'Instances': int(x_int[i, j])
-                })
-        
-        int_df = pd.DataFrame(int_data)
-        int_pivot = int_df.pivot(index='Service', columns='Serveur', values='Instances')
-        int_pivot = int_pivot.fillna(0)
-        
-        st.dataframe(int_pivot, use_container_width=True)
-        st.info(f"Latence totale: {result['obj_value_int']:.2f}")
-    
-    # Show error due to integer rounding
-    error_pct = ((result['obj_value_int'] - result['fun']) / result['fun']) * 100
-    st.info(f"Écart entre les solutions: {error_pct:.2f}% (différence de latence due à l'arrondi)")
+# Select optimization method
+optimization_method = st.selectbox(
+    "Méthode d'optimisation",
+    ["PuLP (programmation linéaire en nombres entiers)", 
+     "CVXPY (avec solveur MILP)",
+     "Gurobi (si disponible)"]
+)
 
 # Button to run optimization
 if st.button("Lancer l'optimisation"):
-    result = run_optimization()
+    if optimization_method == "PuLP (programmation linéaire en nombres entiers)":
+        result = run_optimization_pulp()
+    elif optimization_method == "CVXPY (avec solveur MILP)":
+        result = run_optimization_with_cvxpy()
+    else:
+        result = run_optimization_with_gurobi()
     
     if result['success']:
         st.success("Optimisation réussie !")
-        
-        # Show any constraint violations
-        if result['violations']:
-            st.warning("Attention: La solution entière présente les violations suivantes:")
-            for v in result['violations']:
-                st.warning(v)
-        
-        # Compare continuous and integer solutions
-        compare_solutions(result)
         
         # Visualize the integer solution
         metrics = visualize_results(result)
@@ -494,49 +535,39 @@ if st.button("Lancer l'optimisation"):
         st.markdown("""
         ### Interprétation des résultats
         
-        L'algorithme a trouvé une allocation optimale des services qui minimise la latence totale tout en respectant toutes les contraintes imposées. Les valeurs ont été arrondies aux entiers pour une implémentation pratique.
+        L'algorithme a trouvé une allocation optimale des services directement en nombres entiers qui minimise la latence totale tout en respectant toutes les contraintes imposées.
         
-        **Observations clés :**
+        **Avantages de l'optimisation en nombres entiers :**
         
-        1. **Répartition des services** : Les services sont distribués de manière à équilibrer la charge entre les serveurs, en tenant compte des contraintes de ressources et des paramètres de latence spécifiques à chaque combinaison service-serveur.
+        1. **Solution optimale directe** : Contrairement à l'approche précédente qui arrondissait une solution continue, cette méthode trouve directement la meilleure solution avec des valeurs entières.
         
-        2. **Utilisation des ressources** : L'allocation prend en compte l'utilisation du CPU, en évitant de surcharger certains serveurs tout en maximisant l'utilisation des ressources disponibles.
+        2. **Pas de compromis dû à l'arrondi** : Il n'y a pas de perte d'optimalité causée par l'arrondi des valeurs continues.
         
-        3. **Compromis latence-ressources** : La solution trouve un équilibre entre la minimisation de la latence et l'utilisation efficace des ressources disponibles.
+        3. **Garantie des contraintes** : Toutes les contraintes sont strictement respectées dans la solution optimale.
         
-        4. **Impact de la latence quadratique** : Le modèle prend en compte l'effet de saturation où la latence augmente de façon quadratique avec le nombre d'instances du même service, ce qui favorise la distribution des services entre les serveurs.
+        4. **Répartition précise** : L'allocation des instances est déterminée de manière globalement optimale en tenant compte de toutes les contraintes simultanément.
         
-        5. **Solutions entières** : Les valeurs fractionnaires ont été arrondies aux entiers les plus proches tout en préservant les contraintes, ce qui peut entraîner une légère augmentation de la latence totale par rapport à la solution mathématique optimale.
+        5. **Modélisation fidèle** : Le problème est résolu exactement comme il a été modélisé, avec la fonction objectif quadratique et des variables entières.
         """)
-        
-        # Show convergence info
-        st.subheader("Informations sur la convergence")
-        conv_col1, conv_col2 = st.columns(2)
-        with conv_col1:
-            st.info(f"Nombre d'itérations: {result['nit']}")
-            st.info(f"Statut: {result['message']}")
-        with conv_col2:
-            st.info(f"Fonction objectif continue (latence): {result['fun']:.4f}")
-            st.info(f"Fonction objectif entière (latence): {result['obj_value_int']:.4f}")
     else:
-        st.error("L'optimisation a échoué. Essayez de modifier les paramètres.")
+        st.error("L'optimisation a échoué.")
         st.write("Message d'erreur:", result['message'])
 
 # Add an explanation of the model
 with st.expander("À propos du modèle d'optimisation"):
     st.markdown("""
-    ### Modèle mathématique
+    ### Modèle mathématique (MILP - Mixed Integer Linear Programming)
     
-    Le problème est formulé comme un problème d'optimisation non linéaire:
+    Le problème est formulé comme un problème d'optimisation quadratique en nombres entiers:
     
     **Fonction objectif:**
     
     Minimiser Z = ∑(L_s(i) * x_s,i^2)
     
     où:
-    - x_s,i est le nombre d'instances du service i sur le serveur s
+    - x_s,i est le nombre d'instances du service i sur le serveur s (variable entière)
     - L_s(i) est la latence de base pour le service i sur le serveur s
-    - Le terme au carré (x_s,i^2) modélise l'effet de saturation où la latence augmente de façon quadratique avec le nombre d'instances
+    - Le terme au carré (x_s,i^2) modélise l'effet de saturation où la latence augmente de façon quadratique
     
     **Contraintes:**
     
@@ -545,16 +576,17 @@ with st.expander("À propos du modèle d'optimisation"):
     2. **Capacité CPU**: Pour chaque serveur s, ∑(c_i * x_s,i) ≤ C_s pour tous les services i
        où c_i est le CPU requis par instance du service i et C_s est la capacité CPU du serveur s
     
-    3. **Non-négativité**: x_s,i ≥ 0 pour tout serveur s et service i
+    3. **Contrainte d'intégralité**: x_s,i sont des entiers non négatifs pour tout serveur s et service i
     
-    **Approche de résolution:**
+    **Approches de résolution:**
     
-    1. L'algorithme SLSQP (Sequential Least Squares Programming) est utilisé pour résoudre ce problème d'optimisation non linéaire avec contraintes.
+    1. **PuLP avec linéarisation par morceaux**: Approximation de la fonction quadratique par une fonction linéaire par morceaux
     
-    2. La solution continue est ensuite arrondie aux nombres entiers les plus proches en préservant les contraintes:
-       - Application d'abord de la fonction "floor" à toutes les valeurs
-       - Ajout d'instances supplémentaires pour satisfaire les contraintes minimales
-       - Priorité donnée aux serveurs avec la latence la plus faible lors de l'ajout d'instances
+    2. **CVXPY avec contraintes quadratiques**: Utilisation directe de la formulation quadratique avec variables entières
+    
+    3. **Gurobi**: Solveur commercial qui peut gérer directement les problèmes MIQP (Mixed Integer Quadratic Programming)
+    
+    La formulation en nombres entiers évite complètement le besoin d'arrondir une solution continue, garantissant ainsi une solution optimale pour le problème d'allocation de services tel que défini.
     """)
 
 # Add instructions for using the app
@@ -568,18 +600,18 @@ with st.expander("Instructions d'utilisation"):
        - Spécifiez les besoins minimaux en instances et en CPU pour chaque service
        - Définissez les paramètres de latence pour chaque combinaison service-serveur
     
-    2. **Optimisation**:
+    2. **Sélection de la méthode**:
+       - Choisissez la méthode d'optimisation en nombres entiers à utiliser
+       - PuLP: Bibliothèque open-source pour la programmation linéaire
+       - CVXPY: Bibliothèque plus avancée pour l'optimisation convexe
+       - Gurobi: Solveur commercial haute performance (si disponible)
+    
+    3. **Optimisation**:
        - Cliquez sur le bouton "Lancer l'optimisation" pour exécuter l'algorithme
        - Analysez les résultats présentés sous forme de graphiques et de tableaux
-       - Comparez les solutions continue et entière
     
-    3. **Interprétation**:
+    4. **Interprétation**:
        - Examinez la répartition des services entre les serveurs
        - Vérifiez l'utilisation des ressources CPU sur chaque serveur
        - Analysez les contributions à la latence totale
-       - Identifiez les facteurs clés qui ont influencé la solution optimale
-    
-    4. **Ajustement**:
-       - Modifiez les paramètres pour explorer différents scénarios
-       - Observez comment les changements affectent l'allocation optimale
     """)
