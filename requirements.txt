@@ -6,3 +6,5 @@ plotly
 scipy
 pulp
 cvxpy
+osqp
+mosek
