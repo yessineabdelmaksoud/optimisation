@@ -2,7 +2,6 @@ streamlit
 plotly
 pandas
 numpy
-plotly
 scipy
 pulp
 cvxpy
